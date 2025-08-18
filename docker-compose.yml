@@ -1,0 +1,66 @@
+services:
+  reddit-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reddit-scraper:latest
+    container_name: reddit-scraper
+    env_file:
+      - .env
+    environment:
+      REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID}
+      REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET}
+      REDDIT_SCRAPER_REFRESH_TOKEN: ${REDDIT_SCRAPER_REFRESH_TOKEN}
+      REDDIT_SCRAPER_SUBREDDIT: ${REDDIT_SCRAPER_SUBREDDIT}
+      REDDIT_SCRAPER_DAYS_BACK: ${REDDIT_SCRAPER_DAYS_BACK}
+      REDDIT_SCRAPER_DB_PATH: /data/sqlite/${REDDIT_SCRAPER_SUBREDDIT}.db
+      REDDIT_SCRAPER_CONCURRENCY: ${REDDIT_SCRAPER_CONCURRENCY}
+      REDDIT_SCRAPER_VERBOSE: "1"
+      REDDIT_SCRAPER_UA: "reddit-crypt/3.1 by script (docker)"
+      REDDIT_SCRAPER_PG_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?sslmode=${PG_SSLMODE}
+    volumes:
+      - ./data/sqlite:/data/sqlite
+    command: ["node", "index.js"]
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./data/pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scraperadmin -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${POSTGRES_EMAIL}
+      PGADMIN_DEFAULT_USER: ${POSTGRES_USER}
+      PGADMIN_DEFAULT_PASSWORD: ${POSTGRES_PASSWORD}
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+      PGADMIN_CONFIG_CONSOLE_LOG_LEVEL: "30"
+      PGADMIN_CONFIG_LOGIN_BANNER: '"Authorized use only"'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  pg_data:
+  pgadmin_data:

@@ -1,0 +1,16 @@
+{
+  "name": "reddit-scraper",
+  "version": "0.0.3",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node src/index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "pg": "^8.16.3"
+  }
+}
