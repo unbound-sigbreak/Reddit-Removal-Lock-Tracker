@@ -158,6 +158,8 @@ const ensurePgDatabase = async () => {
   try {
     const c = new PgClient({ connectionString: opts.pgUrl });
     await c.connect();
+    await c.query(`SELECT 1`);
+    console.log(`[storage] connected to pg database.`);
     return c;
   } catch (e) {
     const msg = e?.message || "";
@@ -237,20 +239,46 @@ const safeParseJson = (t) => {
 
 const appendSeriesString = (prevText, entry, dedupeKeys = [], max = 0, dedupe = true) => {
   let arr = safeParseJson(prevText);
-  const last = arr[arr.length - 1];
-  let same = false;
-  if (dedupe && last) {
-    same = dedupeKeys.every(k => {
-      const a = last[k]; const b = entry[k];
-      return (a === b) || (a == null && b == null);
-    });
-  }
-  if (!same) {
+
+  if (!dedupe) {
     arr.push(entry);
-    if (max > 0 && arr.length > max) arr = arr.slice(arr.length - max);
+  } else {
+    const eq = (a, b) => {
+      if (!a || !b) return false;
+      return dedupeKeys.every((k) => {
+        const av = a[k]; const bv = b[k];
+        return (av === bv) || (av == null && bv == null);
+      });
+    };
+
+    if (arr.length === 0) {
+      arr.push(entry);
+    } else {
+      const last = arr[arr.length - 1];
+      if (eq(entry, last)) {
+        if (arr.length === 1) {
+          arr.push(entry);
+        } else {
+          const prev = arr[arr.length - 2];
+          if (!eq(prev, last)) {
+            arr.push(entry);
+          } else {
+            arr[arr.length - 1] = entry;
+          }
+        }
+      } else {
+        arr.push(entry);
+      }
+    }
   }
+
+  if (max > 0 && arr.length > max) {
+    arr = arr.slice(arr.length - max);
+  }
+
   return JSON.stringify(arr);
 };
+
 
 const fetchWithTimeout = async (url, init = {}, timeoutMs = opts.fetchTimeoutMs) => {
   const ctrl = new AbortController();
@@ -411,21 +439,69 @@ let pg = null;
 const initPg = async () => {
   if (!opts.pgUrl) {
     console.log("[storage] Postgres disabled (no REDDIT_SCRAPER_PG_URL)");
+    pgConnected = false;
     return;
   }
 
   try {
-    try {
-      pg = await ensurePgDatabase();
-    } catch (e1) {
-      console.warn(`[storage] PG init first attempt failed: ${e1.message || e1}; retrying in 1000ms`);
-      await sleep(1000);
-      pg = await ensurePgDatabase();
+    pg = await ensurePgDatabase();
+  } catch (e1) {
+    console.warn(`[storage] PG init first attempt failed: ${e1.message || e1}; retrying in 2000ms`);
+    await sleep(2000);
+    pg = await ensurePgDatabase();
+  }
+
+  const PG_MAINTENANCE_DB = process.env.POSTGRES_MAINTENANCE_DB || "postgres";
+  const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
+  const buildPgUrlWithDb = (dsn, dbName) => {
+    const u = new URL(dsn);
+    u.pathname = `/${encodeURIComponent(dbName)}`;
+    return u.toString();
+  };
+
+  const connectOnce = async (dsn) => {
+    const c = new PgClient({ connectionString: dsn });
+    await c.connect();
+    return c;
+  };
+
+  let client = null;
+
+  try {
+    client = await connectOnce(opts.pgUrl);
+  } catch (e) {
+    const code = e?.code || "";
+    const msg = e?.message || "";
+    if (code === "57P03" || /starting up/i.test(msg)) {
+      console.warn(`[storage] PG not ready (${msg}); retrying in 2000ms`);
+      await sleep(2000);
+      client = await connectOnce(opts.pgUrl);
+    } else if (code === "3D000" || /does not exist/i.test(msg)) {
+      const target = new URL(opts.pgUrl);
+      const targetDb = (target.pathname || "/").replace(/^\//, "");
+      const targetUser = decodeURIComponent(target.username || "");
+      const adminUrl = buildPgUrlWithDb(opts.pgUrl, PG_MAINTENANCE_DB);
+
+      const admin = await connectOnce(adminUrl);
+      try {
+        try {
+          await admin.query(`CREATE DATABASE ${ident(targetDb)} WITH OWNER ${ident(targetUser)}`);
+          console.log(`[storage] created database ${targetDb} (owner=${targetUser}) via ${PG_MAINTENANCE_DB}`);
+        } catch (ce) {
+          if (ce?.code !== "42P04") throw ce; // already exists
+          console.log(`[storage] database ${targetDb} already exists (race)`);
+        }
+      } finally {
+        await admin.end().catch(() => {});
+      }
+
+      client = await connectOnce(opts.pgUrl);
+    } else {
+      throw e;
     }
-    
-    pg = new PgClient({ connectionString: opts.pgUrl });
-    await pg.connect();
-    await pg.query(`
+  }
+
+  await client.query(`
 CREATE TABLE IF NOT EXISTS posts (
   id TEXT PRIMARY KEY,
   name TEXT,
@@ -476,12 +552,11 @@ CREATE TABLE IF NOT EXISTS comments (
   score_series JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
-    `);
-  } catch (e) {
-    console.error("Postgres init failed:", e.message || e);
-    pg = null;
-    pgConnected = false;
-  }
+  `);
+
+  pg = client;
+  pgConnected = true;
+  console.log("[storage] Postgres connected and schema ensured");
 };
 
 const selectPostByIdSql = sqlite.prepare(
@@ -730,16 +805,22 @@ const fetchCommentsForPosts = async (ids, phaseLabel, secondSort = null) => {
 
   const fetchAndMergeForPost = async (postId, sorts) => {
     const map = new Map();
+
     for (const s of sorts) {
       const listing = await fetchCommentsForPost(postId, s);
       const flat = flattenComments(listing, postId);
       for (const c of flat) map.set(c.id, c);
     }
+
+    const mirrors = [];
     for (const c of map.values()) {
       const firstTimeThisRun = !commentsSeriesBumpedThisRun.has(c.id);
-      upsertCommentWithSeries(c, firstTimeThisRun);
+      const p = upsertCommentWithSeries(c, firstTimeThisRun);
       commentsSeriesBumpedThisRun.add(c.id);
+      if (p && typeof p.then === "function") mirrors.push(p);
     }
+    if (mirrors.length) await Promise.allSettled(mirrors);
+
     return map.size;
   };
 
@@ -755,6 +836,7 @@ const fetchCommentsForPosts = async (ids, phaseLabel, secondSort = null) => {
       }
     }));
   }
+
   logv(`comments:${phaseLabel} done targets=${idsArr.length}`);
   return { targets: idsArr.length };
 };

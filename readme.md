@@ -195,6 +195,19 @@ REDDIT_SCRAPER_VERBOSE, REDDIT_SCRAPER_UA
 
 ---
 
+## Docker push (self hosted repo):
+```
+docker build .
+
+docker tag reddit-scraper DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:latest
+docker tag reddit-scraper DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:v0.0.X
+
+docker push DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:latest
+docker push DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:v0.0.X
+```
+
+---
+
 ## 7) Troubleshooting
 - **No tables in Postgres**: verify `REDDIT_SCRAPER_PG_URL` (compose builds it from `POSTGRES_*`) and that `POSTGRES_DB` matches what you open in pgAdmin. Run the scraper once; it creates tables.
 - **`relation "posts" does not exist`**: refresh pgAdmin (**Schemas → public → Tables**) after a successful run.
