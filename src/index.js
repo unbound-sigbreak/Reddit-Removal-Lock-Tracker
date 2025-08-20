@@ -13,11 +13,12 @@ Reddit removal/lock tracker + heuristic reporting + karma-over-time series
 - Removed moderator posts/comments tracking ability from main script to prevent stalking and abuse.
 */
 
-const UAC = "reddit-scraper/0.0.5";
+const UAC = "reddit-scraper/0.0.6";
 
 const fs = require("fs");
 const path = require("path");
 const process = require("process");
+const os = require("os");
 const Database = require("better-sqlite3");
 const { Client: PgClient } = require("pg");
 
@@ -55,6 +56,7 @@ const opts = {
   ua: (process.env.REDDIT_SCRAPER_UA || UAC),
   webhookUrl: process.env.REDDIT_SCRAPER_WEBHOOK_URL || null,
   webhookTimeoutMs: Math.max(1000, Number(process.env.REDDIT_SCRAPER_WEBHOOK_TIMEOUT_MS || 5000)),
+  trackModActivity: process.env.REDDIT_SCRAPER_TRACK_MOD_ACTIVITY === "0" ? false : true,
 };
 
 const pickNext = (flag, i) => {
@@ -77,6 +79,7 @@ Usage:
            [--series-max 288] [--no-series-dedupe-posts] \\
            [--comment-series-max 288] [--comment-series-dedupe] \\
            [--completion-webhook <URL>] [--completion-webhook-timeout 5000] \\
+           [--no-mod-activity] \\
            [--report] [--verbose] [--help|-h]
 `);
   process.exit(code);
@@ -114,6 +117,7 @@ for (let i = 0; i < argv.length; i++) {
     case "--report": opts.report = true; break;
     case "--completion-webhook": opts.completionWebhook = pickNext(a, i++);; break;
     case "--completion-webhook-timeout": opts.completionWebhookTimeout = pickNext(a, i++);; break;
+    case "--no-mod-activity": opts.trackModActivity = false; break;
     case "--verbose": opts.verbose = true; break;
 
     case "--help":
@@ -212,6 +216,35 @@ const TOKEN_URL = "https://www.reddit.com/api/v1/access_token";
 const nowSec = () => Math.floor(Date.now() / 1000);
 const iso = (s) => new Date(s * 1000).toISOString();
 const commentsSeriesBumpedThisRun = new Set();
+let MOD_SET = new Set();
+let RUN_WINDOW_START = 0;
+
+const isModerator = (author) => !!author && MOD_SET.has(String(author).toLowerCase());
+
+const fetchModerators = async (sub) => {
+  const url = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}/about/moderators.json?limit=1000`;
+  const j = await redditJson(url);
+  const names = (j?.data?.children || []).map((x) => (x?.name || "")).filter(Boolean);
+  return new Set(names.map((n) => n.toLowerCase()));
+};
+
+const maybeLogModActivity = async ({ kind, actor, subreddit, post_id, comment_id, created_utc, edited }) => {
+  if (!opts.trackModActivity) return;
+  if (!isModerator(actor)) return;
+  if (created_utc == null || created_utc < RUN_WINDOW_START) return;
+  const nowts = nowSec();
+  const activity_key = comment_id ? `t1_${comment_id}` : `t3_${post_id}`;
+  const payload = {
+    activity_key, actor, kind, subreddit, post_id,
+    comment_id: comment_id || null,
+    activity_created_utc: created_utc,
+    activity_edited_utc: (typeof edited === "number") ? edited : null,
+    first_picked_up_utc: nowts,
+    last_seen_utc: nowts
+  };
+  try { upsertModActivitySql.run(payload); } catch (e) { console.error("sqlite mod-activity upsert fail:", e.message || e); }
+  await mirrorModActivityPg(payload);
+};
 
 const parseWhen = (s) => {
   if (!s) return null;
@@ -402,8 +435,8 @@ CREATE TABLE IF NOT EXISTS posts (
   score INTEGER,
   upvote_ratio REAL,
   num_comments INTEGER,
-  url TEXT,              -- subreddit permalink
-  external_url TEXT,     -- outbound link if any
+  url TEXT,
+  external_url TEXT,
   selftext TEXT,
   domain TEXT,
   link_flair_text TEXT,
@@ -416,7 +449,7 @@ CREATE TABLE IF NOT EXISTS posts (
   removed_at INTEGER,
   locked_at INTEGER,
   last_checked INTEGER,
-  score_series TEXT       -- JSON array of {ts, score, upvote_ratio, num_comments, locked, removed}
+  score_series TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_utc);
 CREATE INDEX IF NOT EXISTS idx_posts_flair ON posts(link_flair_text);
@@ -440,6 +473,22 @@ CREATE TABLE IF NOT EXISTS comments (
   score_series TEXT       -- JSON array of {ts, score}
 );
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
+
+CREATE TABLE IF NOT EXISTS moderator_activity (
+  activity_key TEXT PRIMARY KEY,
+  actor TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  subreddit TEXT NOT NULL,
+  post_id TEXT NOT NULL,
+  comment_id TEXT,
+  activity_created_utc INTEGER NOT NULL,
+  activity_edited_utc INTEGER,
+  first_picked_up_utc INTEGER NOT NULL,
+  last_seen_utc INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_modact_actor ON moderator_activity(actor);
+CREATE INDEX IF NOT EXISTS idx_modact_created ON moderator_activity(activity_created_utc);
+CREATE INDEX IF NOT EXISTS idx_modact_sub ON moderator_activity(subreddit);
 `);
 
 let pg = null;
@@ -559,7 +608,23 @@ CREATE TABLE IF NOT EXISTS comments (
   score_series JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
-  `);
+
+CREATE TABLE IF NOT EXISTS moderator_activity (
+  activity_key TEXT PRIMARY KEY,
+  actor TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  subreddit TEXT NOT NULL,
+  post_id TEXT NOT NULL,
+  comment_id TEXT,
+  activity_created_utc BIGINT NOT NULL,
+  activity_edited_utc BIGINT,
+  first_picked_up_utc BIGINT NOT NULL,
+  last_seen_utc BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_modact_actor ON moderator_activity(actor);
+CREATE INDEX IF NOT EXISTS idx_modact_created ON moderator_activity(activity_created_utc);
+CREATE INDEX IF NOT EXISTS idx_modact_sub ON moderator_activity(subreddit);
+`);
 
   pg = client;
   pgConnected = true;
@@ -623,6 +688,25 @@ ON CONFLICT(id) DO UPDATE SET
   collapsed_reason=excluded.collapsed_reason,
   last_checked=excluded.last_checked,
   score_series=excluded.score_series
+`);
+
+const upsertModActivitySql = sqlite.prepare(`
+INSERT INTO moderator_activity (
+  activity_key, actor, kind, subreddit, post_id, comment_id,
+  activity_created_utc, activity_edited_utc, first_picked_up_utc, last_seen_utc
+  ) VALUES (
+  @activity_key, @actor, @kind, @subreddit, @post_id, @comment_id,
+  @activity_created_utc, @activity_edited_utc, @first_picked_up_utc, @last_seen_utc
+)
+  ON CONFLICT(activity_key) DO UPDATE SET
+  first_picked_up_utc = COALESCE(moderator_activity.first_picked_up_utc, excluded.first_picked_up_utc),
+  activity_edited_utc = COALESCE(excluded.activity_edited_utc, moderator_activity.activity_edited_utc),
+  last_seen_utc = excluded.last_seen_utc,
+  actor = excluded.actor,
+  kind = excluded.kind,
+  subreddit = excluded.subreddit,
+  post_id = excluded.post_id,
+  comment_id = excluded.comment_id
 `);
 
 const mirrorPostPg = async (p) => {
@@ -699,6 +783,34 @@ const mirrorCommentPg = async (c) => {
     );
   } catch (e) {
     console.error(`PG comment upsert failed for ${c.id}:`, e.message || e);
+  }
+};
+
+const mirrorModActivityPg = async (m) => {
+  if (!pg) return;
+  try {
+    await pg.query(
+      `INSERT INTO moderator_activity (
+         activity_key, actor, kind, subreddit, post_id, comment_id,
+         activity_created_utc, activity_edited_utc, first_picked_up_utc, last_seen_utc
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (activity_key) DO UPDATE SET
+         actor = EXCLUDED.actor,
+         kind = EXCLUDED.kind,
+         subreddit = EXCLUDED.subreddit,
+         post_id = EXCLUDED.post_id,
+         comment_id = EXCLUDED.comment_id,
+         activity_edited_utc = COALESCE(EXCLUDED.activity_edited_utc, moderator_activity.activity_edited_utc),
+         first_picked_up_utc = LEAST(moderator_activity.first_picked_up_utc, EXCLUDED.first_picked_up_utc),
+         last_seen_utc = EXCLUDED.last_seen_utc`,
+      [
+        m.activity_key, m.actor, m.kind, m.subreddit, m.post_id, m.comment_id,
+        m.activity_created_utc, m.activity_edited_utc, m.first_picked_up_utc, m.last_seen_utc
+      ]
+    );
+  } catch (e) {
+    console.error(`PG mod-activity upsert failed for ${m.activity_key}:`, e.message || e);
   }
 };
 
@@ -825,6 +937,16 @@ const fetchCommentsForPosts = async (ids, phaseLabel, secondSort = null) => {
       const p = upsertCommentWithSeries(c, firstTimeThisRun);
       commentsSeriesBumpedThisRun.add(c.id);
       if (p && typeof p.then === "function") mirrors.push(p);
+
+      maybeLogModActivity({
+        kind: "comment",
+        actor: c.author,
+        subreddit: opts.subreddit,
+        post_id: c.post_id,
+        comment_id: c.id,
+        created_utc: c.created_utc,
+        edited: c.edited
+      }).catch(() => {});
     }
     if (mirrors.length) await Promise.allSettled(mirrors);
 
@@ -959,6 +1081,16 @@ const scanNewAndUpsert = async () => {
       postsSeen++;
       commentTargets.push(d.id);
 
+      maybeLogModActivity({
+        kind: "post",
+        actor: row.author,
+        subreddit: row.subreddit,
+        post_id: row.id,
+        comment_id: null,
+        created_utc: row.created_utc,
+        edited: row.edited
+      }).catch(() => {});
+
       console.log(
         `[${iso(cu)}] ${d.id} "${oneLine(d.title || "")}" flair="${d.link_flair_text || ""}" domain="${d.domain || ""}" removed=${row.removed_by_category} locked=${!!row.locked}`
       );
@@ -1039,6 +1171,16 @@ const recheckWindowAndUpsert = async () => {
         };
         await upsertPostWithTransitions(row);
         postUpdates++;
+
+        maybeLogModActivity({
+          kind: "post",
+          actor: row.author,
+          subreddit: row.subreddit,
+          post_id: row.id,
+          comment_id: null,
+          created_utc: row.created_utc,
+          edited: row.edited
+        }).catch(() => {});
       }
       postBatches++;
       logv(`recheck: batch=${postBatches} updated=${postUpdates}`);
@@ -1139,6 +1281,23 @@ const reportHeuristics = () => {
     }
   } catch (e) { console.error("report comments:", e.message || e); }
 
+    try {
+    const rows = sqlite.prepare(`
+      SELECT actor, COUNT(*) AS events,
+             MIN(activity_created_utc) AS first_utc,
+             MAX(activity_created_utc) AS last_utc
+      FROM moderator_activity
+      WHERE activity_created_utc >= ?
+      GROUP BY actor
+      ORDER BY events DESC, actor ASC
+      LIMIT 50
+    `).all(RUN_WINDOW_START);
+    console.log("--- Mod Activity (last window) ---");
+    for (const r of rows) {
+      console.log(`actor=u/\${r.actor} events=\${r.events} first=\${iso(r.first_utc)} last=\${iso(r.last_utc)}`);
+    }
+  } catch (e) { console.error("report mods:", e.message || e); }
+
   console.log("=== End Heuristic Report ===");
 };
 
@@ -1153,6 +1312,16 @@ const main = async () => {
   console.log(`[startup] postgres=${opts.pgUrl ? pgDsnPretty(opts.pgUrl) : "disabled"}`);
 
   await initPg();
+  RUN_WINDOW_START = nowSec() - opts.daysBack * 86400;
+  if (opts.trackModActivity) {
+    try {
+      MOD_SET = await fetchModerators(opts.subreddit);
+      logv(`mods: fetched ${MOD_SET.size}`);
+    } catch (e) {
+      console.error("failed to fetch moderators:", e.message || e);
+      MOD_SET = new Set();
+    }
+  }
 
   let pages = 0, postsSeen = 0;
   let recheckPostUpdates = 0, recheckBatches = 0, recheckIds = 0;
