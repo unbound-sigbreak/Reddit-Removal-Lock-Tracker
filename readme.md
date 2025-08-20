@@ -167,15 +167,16 @@ docker compose run --rm reddit-scraper \
 **Full CLI (for reference):**
 ```
 index.js --client-id <id> --client-secret <secret> --refresh-token <tok> \
-         --subreddit <name> [--days-back 4] [--start <ISO|epoch>] [--end <ISO|epoch>] \
-         [--db <sqlite path>] [--pg-url <postgres dsn>] \
-         [--concurrency 2] [--max-pages N] [--max-posts N] \
-         [--no-comments] [--no-recheck-comments] \
-         [--initial-comment-limit N] [--recheck-comment-limit N] \
-         [--fetch-timeout-ms 20000] [--ua "reddit-crypt/3.1 by script"] \
-         [--series-max 288] [--no-series-dedupe-posts] \
-         [--comment-series-max 288] [--comment-series-dedupe] \
-         [--report] [--verbose] [--help|-h]
+        --subreddit <name> [--days-back 4] [--start <ISO|epoch>] [--end <ISO|epoch>] \
+        [--db <sqlite path>] [--pg-url <postgres dsn>] \
+        [--concurrency 2] [--max-pages N] [--max-posts N] \
+        [--no-comments] [--no-recheck-comments] \
+        [--initial-comment-limit N] [--recheck-comment-limit N] \
+        [--fetch-timeout-ms 20000] [--ua "reddit-crypt/3.1 by script"] \
+        [--series-max 288] [--no-series-dedupe-posts] \
+        [--comment-series-max 288] [--comment-series-dedupe] \
+        [--completion-webhook <URL>] [--completion-webhook-timeout 5000] \
+        [--report] [--verbose] [--help|-h]
 ```
 
 **Environment (the app reads):**
@@ -190,7 +191,8 @@ REDDIT_SCRAPER_INITIAL_COMMENT_LIMIT, REDDIT_SCRAPER_RECHECK_COMMENT_LIMIT,
 REDDIT_SCRAPER_FETCH_TIMEOUT_MS, REDDIT_SCRAPER_REPORT,
 REDDIT_SCRAPER_SERIES_MAX, REDDIT_SCRAPER_SERIES_DEDUPE_POSTS,
 REDDIT_SCRAPER_COMMENT_SERIES_MAX, REDDIT_SCRAPER_COMMENT_SERIES_DEDUPE,
-REDDIT_SCRAPER_VERBOSE, REDDIT_SCRAPER_UA
+REDDIT_SCRAPER_VERBOSE, REDDIT_SCRAPER_UA,
+REDDIT_SCRAPER_WEBHOOK_URL, REDDIT_SCRAPER_WEBHOOK_TIMEOUT_MS,
 ```
 
 ---

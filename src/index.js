@@ -13,6 +13,8 @@ Reddit removal/lock tracker + heuristic reporting + karma-over-time series
 - Removed moderator posts/comments tracking ability from main script to prevent stalking and abuse.
 */
 
+const UAC = "reddit-scraper/0.0.5";
+
 const fs = require("fs");
 const path = require("path");
 const process = require("process");
@@ -50,7 +52,9 @@ const opts = {
   commentSeriesDedupe: process.env.REDDIT_SCRAPER_COMMENT_SERIES_DEDUPE === "1",
 
   verbose: !!process.env.REDDIT_SCRAPER_VERBOSE,
-  ua: (process.env.REDDIT_SCRAPER_UA || "reddit-scraper/0.0.3"),
+  ua: (process.env.REDDIT_SCRAPER_UA || UAC),
+  webhookUrl: process.env.REDDIT_SCRAPER_WEBHOOK_URL || null,
+  webhookTimeoutMs: Math.max(1000, Number(process.env.REDDIT_SCRAPER_WEBHOOK_TIMEOUT_MS || 5000)),
 };
 
 const pickNext = (flag, i) => {
@@ -69,9 +73,10 @@ Usage:
            [--concurrency 2] [--max-pages N] [--max-posts N] \\
            [--no-comments] [--no-recheck-comments] \\
            [--initial-comment-limit N] [--recheck-comment-limit N] \\
-           [--fetch-timeout-ms 20000] [--ua "reddit-crypt/3.1 by script"] \\
+           [--fetch-timeout-ms 20000] [--ua ${UAC}] \\
            [--series-max 288] [--no-series-dedupe-posts] \\
            [--comment-series-max 288] [--comment-series-dedupe] \\
+           [--completion-webhook <URL>] [--completion-webhook-timeout 5000] \\
            [--report] [--verbose] [--help|-h]
 `);
   process.exit(code);
@@ -107,6 +112,8 @@ for (let i = 0; i < argv.length; i++) {
     case "--comment-series-dedupe": opts.commentSeriesDedupe = true; break;
     case "--ua": opts.ua = pickNext(a, i++); break;
     case "--report": opts.report = true; break;
+    case "--completion-webhook": opts.completionWebhook = pickNext(a, i++);; break;
+    case "--completion-webhook-timeout": opts.completionWebhookTimeout = pickNext(a, i++);; break;
     case "--verbose": opts.verbose = true; break;
 
     case "--help":
@@ -857,6 +864,31 @@ const idsFromPgWindow = async (windowStartSec) => {
   }
 };
 
+const postCompletionWebhook = async (url, payload) => {
+  try {
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "User-Agent": UA,
+        },
+        body: JSON.stringify(payload),
+      },
+      opts.webhookTimeoutMs
+    );
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status} ${res.statusText}: ${t.slice(0, 500)}`);
+    }
+    console.log(`[webhook] posted summary to ${url}`);
+  } catch (e) {
+    console.error(`[webhook] post failed: ${e.message ?? e}`);
+  }
+};
+
 const scanNewAndUpsert = async () => {
   const maxBackCutoff = nowSec() - opts.daysBack * 86400;
   const startCutoff = Math.max(parseWhen(opts.start) ?? 0, maxBackCutoff);
@@ -1116,6 +1148,7 @@ const shutdown = async () => {
 };
 
 const main = async () => {
+  const runStartMs = Date.now();
   console.log(`[startup] sqlite=${opts.dbPath}`);
   console.log(`[startup] postgres=${opts.pgUrl ? pgDsnPretty(opts.pgUrl) : "disabled"}`);
 
@@ -1138,18 +1171,42 @@ const main = async () => {
     console.error("fatal:", e.message || e);
     process.exitCode = 1;
   } finally {
+    const endMs = Date.now();
+    const summary = {
+      subreddit: opts.subreddit,
+      sqlite_path: opts.dbPath,
+      postgres: opts.pgUrl ? pgDsnPretty(opts.pgUrl) : null,
+      storage_mode: pgConnected ? "sqlite+pg" : "sqlite-only",
+      pages,
+      posts_seen: postsSeen,
+      recheck_ids: recheckIds,
+      recheck_post_batches: recheckBatches,
+      recheck_post_updates: recheckPostUpdates,
+      started_at: new Date(runStartMs).toISOString(),
+      ended_at: new Date(endMs).toISOString(),
+      duration_ms: endMs - runStartMs,
+      ua: UA,
+      host: os.hostname(),
+      pid: process.pid,
+      exit_code: process.exitCode || 0,
+    };
+
+    if (opts.webhookUrl) {
+      await postCompletionWebhook(opts.webhookUrl, summary);
+    }
+
+    logKV({
+      Summary: "",
+      pages,
+      storage_mode: pgConnected ? "sqlite+pg" : "sqlite-only",
+      posts_seen: postsSeen,
+      recheck_ids: recheckIds,
+      recheck_post_batches: recheckBatches,
+      recheck_post_updates: recheckPostUpdates,
+    });
+
     await shutdown();
   }
-
-  logKV({
-    Summary: "",
-    pages,
-    storage_mode: pgConnected ? "sqlite+pg" : "sqlite-only",
-    posts_seen: postsSeen,
-    recheck_ids: recheckIds,
-    recheck_post_batches: recheckBatches,
-    recheck_post_updates: recheckPostUpdates,
-  });
 };
 
 process.on("SIGINT", async () => { await shutdown(); process.exit(130); });
