@@ -13,7 +13,7 @@ Reddit removal/lock tracker + heuristic reporting + karma-over-time series
 - Removed moderator posts/comments tracking ability from main script to prevent stalking and abuse.
 */
 
-const UAC = "reddit-scraper/0.0.6";
+const UAC = "reddit-scraper/0.0.7";
 
 const fs = require("fs");
 const path = require("path");
@@ -216,10 +216,16 @@ const TOKEN_URL = "https://www.reddit.com/api/v1/access_token";
 const nowSec = () => Math.floor(Date.now() / 1000);
 const iso = (s) => new Date(s * 1000).toISOString();
 const commentsSeriesBumpedThisRun = new Set();
-let MOD_SET = new Set();
-let RUN_WINDOW_START = 0;
+const commentsSeenThisRun = new Set();
+const modKeysSeenThisRun = new Set();
+const modActorsSeenThisRun = new Set();
+let newRemovalsThisRun = 0;
+let newLocksThisRun = 0;
 
-const isModerator = (author) => !!author && MOD_SET.has(String(author).toLowerCase());
+let modSet = new Set();
+let runWindowStart = 0;
+
+const isModerator = (author) => !!author && modSet.has(String(author).toLowerCase());
 
 const fetchModerators = async (sub) => {
   const url = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}/about/moderators.json?limit=1000`;
@@ -231,7 +237,7 @@ const fetchModerators = async (sub) => {
 const maybeLogModActivity = async ({ kind, actor, subreddit, post_id, comment_id, created_utc, edited }) => {
   if (!opts.trackModActivity) return;
   if (!isModerator(actor)) return;
-  if (created_utc == null || created_utc < RUN_WINDOW_START) return;
+  if (created_utc == null || created_utc < runWindowStart) return;
   const nowts = nowSec();
   const activity_key = comment_id ? `t1_${comment_id}` : `t3_${post_id}`;
   const payload = {
@@ -244,6 +250,8 @@ const maybeLogModActivity = async ({ kind, actor, subreddit, post_id, comment_id
   };
   try { upsertModActivitySql.run(payload); } catch (e) { console.error("sqlite mod-activity upsert fail:", e.message || e); }
   await mirrorModActivityPg(payload);
+  modKeysSeenThisRun.add(activity_key);
+  if (actor) modActorsSeenThisRun.add(String(actor).toLowerCase());
 };
 
 const parseWhen = (s) => {
@@ -828,6 +836,8 @@ const upsertPostWithTransitions = (row) => {
 
   row.removed_at = prev?.removed_at || justRemoved || null;
   row.locked_at  = prev?.locked_at  || justLocked  || null;
+  if (justRemoved) newRemovalsThisRun++;
+  if (justLocked) newLocksThisRun++;
 
   const entry = {
     ts: nowts,
@@ -935,6 +945,7 @@ const fetchCommentsForPosts = async (ids, phaseLabel, secondSort = null) => {
     for (const c of map.values()) {
       const firstTimeThisRun = !commentsSeriesBumpedThisRun.has(c.id);
       const p = upsertCommentWithSeries(c, firstTimeThisRun);
+      commentsSeenThisRun.add(c.id);
       commentsSeriesBumpedThisRun.add(c.id);
       if (p && typeof p.then === "function") mirrors.push(p);
 
@@ -1291,7 +1302,7 @@ const reportHeuristics = () => {
       GROUP BY actor
       ORDER BY events DESC, actor ASC
       LIMIT 50
-    `).all(RUN_WINDOW_START);
+    `).all(runWindowStart);
     console.log("--- Mod Activity (last window) ---");
     for (const r of rows) {
       console.log(`actor=u/\${r.actor} events=\${r.events} first=\${iso(r.first_utc)} last=\${iso(r.last_utc)}`);
@@ -1308,15 +1319,16 @@ const shutdown = async () => {
 
 const main = async () => {
   const runStartMs = Date.now();
+  console.log(`[startup] version=${UAC}`);
   console.log(`[startup] sqlite=${opts.dbPath}`);
   console.log(`[startup] postgres=${opts.pgUrl ? pgDsnPretty(opts.pgUrl) : "disabled"}`);
 
   await initPg();
-  RUN_WINDOW_START = nowSec() - opts.daysBack * 86400;
+  runWindowStart = nowSec() - opts.daysBack * 86400;
   if (opts.trackModActivity) {
     try {
-      MOD_SET = await fetchModerators(opts.subreddit);
-      logv(`mods: fetched ${MOD_SET.size}`);
+      modSet = await fetchModerators(opts.subreddit);
+      logv(`mods: fetched ${modSet.size}`);
     } catch (e) {
       console.error("failed to fetch moderators:", e.message || e);
       MOD_SET = new Set();
@@ -1354,7 +1366,15 @@ const main = async () => {
       started_at: new Date(runStartMs).toISOString(),
       ended_at: new Date(endMs).toISOString(),
       duration_ms: endMs - runStartMs,
+      commentsSeenUnique: commentsSeenThisRun.size,
+      commentSeriesBumped: commentsSeriesBumpedThisRun.size,
+      modActivityEventsUnique: modKeysSeenThisRun.size,
+      modActorsActive: modActorsSeenThisRun.size,
+      modsTracked: modSet.size,
+      modWindowStart: new Date(runWindowStart * 1000).toISOString(),
+      stateChanges: { newRemovals: newRemovalsThisRun, newLocks: newLocksThisRun },
       ua: UA,
+      uac: UAC,
       host: os.hostname(),
       pid: process.pid,
       exit_code: process.exitCode || 0,
@@ -1375,6 +1395,7 @@ const main = async () => {
     });
 
     await shutdown();
+    setImmediate(() => process.exit(0));
   }
 };
 

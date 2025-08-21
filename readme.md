@@ -206,6 +206,14 @@ docker tag reddit-scraper DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:v0.0.X
 
 docker push DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:latest
 docker push DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:v0.0.X
+
+
+# -- or --
+
+docker build --no-cache . -t DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:v0.0.X
+docker build --no-cache . -t DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:latest
+docker push DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:v0.0.X
+docker push DOMAIN.xyz/YOUR_USERNAME/reddit-scraper:latest
 ```
 
 ---
