@@ -13,11 +13,12 @@ Reddit removal/lock tracker + heuristic reporting + karma-over-time series
 - Removed moderator posts/comments tracking ability from main script to prevent stalking and abuse.
 */
 
-const UAC = "reddit-scraper/0.0.5";
+const UAC = "reddit-scraper/0.0.7";
 
 const fs = require("fs");
 const path = require("path");
 const process = require("process");
+const os = require("os");
 const Database = require("better-sqlite3");
 const { Client: PgClient } = require("pg");
 
@@ -212,6 +213,11 @@ const TOKEN_URL = "https://www.reddit.com/api/v1/access_token";
 const nowSec = () => Math.floor(Date.now() / 1000);
 const iso = (s) => new Date(s * 1000).toISOString();
 const commentsSeriesBumpedThisRun = new Set();
+const commentsSeenThisRun = new Set();
+let newRemovalsThisRun = 0;
+let newLocksThisRun = 0;
+
+let runWindowStart = 0;
 
 const parseWhen = (s) => {
   if (!s) return null;
@@ -402,8 +408,8 @@ CREATE TABLE IF NOT EXISTS posts (
   score INTEGER,
   upvote_ratio REAL,
   num_comments INTEGER,
-  url TEXT,              -- subreddit permalink
-  external_url TEXT,     -- outbound link if any
+  url TEXT,
+  external_url TEXT,
   selftext TEXT,
   domain TEXT,
   link_flair_text TEXT,
@@ -416,7 +422,7 @@ CREATE TABLE IF NOT EXISTS posts (
   removed_at INTEGER,
   locked_at INTEGER,
   last_checked INTEGER,
-  score_series TEXT       -- JSON array of {ts, score, upvote_ratio, num_comments, locked, removed}
+  score_series TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_utc);
 CREATE INDEX IF NOT EXISTS idx_posts_flair ON posts(link_flair_text);
@@ -559,7 +565,7 @@ CREATE TABLE IF NOT EXISTS comments (
   score_series JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
-  `);
+`);
 
   pg = client;
   pgConnected = true;
@@ -716,6 +722,8 @@ const upsertPostWithTransitions = (row) => {
 
   row.removed_at = prev?.removed_at || justRemoved || null;
   row.locked_at  = prev?.locked_at  || justLocked  || null;
+  if (justRemoved) newRemovalsThisRun++;
+  if (justLocked) newLocksThisRun++;
 
   const entry = {
     ts: nowts,
@@ -823,6 +831,7 @@ const fetchCommentsForPosts = async (ids, phaseLabel, secondSort = null) => {
     for (const c of map.values()) {
       const firstTimeThisRun = !commentsSeriesBumpedThisRun.has(c.id);
       const p = upsertCommentWithSeries(c, firstTimeThisRun);
+      commentsSeenThisRun.add(c.id);
       commentsSeriesBumpedThisRun.add(c.id);
       if (p && typeof p.then === "function") mirrors.push(p);
     }
@@ -1149,10 +1158,12 @@ const shutdown = async () => {
 
 const main = async () => {
   const runStartMs = Date.now();
+  console.log(`[startup] version=${UAC}`);
   console.log(`[startup] sqlite=${opts.dbPath}`);
   console.log(`[startup] postgres=${opts.pgUrl ? pgDsnPretty(opts.pgUrl) : "disabled"}`);
 
   await initPg();
+  runWindowStart = nowSec() - opts.daysBack * 86400;
 
   let pages = 0, postsSeen = 0;
   let recheckPostUpdates = 0, recheckBatches = 0, recheckIds = 0;
@@ -1185,7 +1196,11 @@ const main = async () => {
       started_at: new Date(runStartMs).toISOString(),
       ended_at: new Date(endMs).toISOString(),
       duration_ms: endMs - runStartMs,
+      commentsSeenUnique: commentsSeenThisRun.size,
+      commentSeriesBumped: commentsSeriesBumpedThisRun.size,
+      stateChanges: { newRemovals: newRemovalsThisRun, newLocks: newLocksThisRun },
       ua: UA,
+      uac: UAC,
       host: os.hostname(),
       pid: process.pid,
       exit_code: process.exitCode || 0,
@@ -1206,6 +1221,7 @@ const main = async () => {
     });
 
     await shutdown();
+    setImmediate(() => process.exit(0));
   }
 };
 
